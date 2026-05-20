@@ -22,6 +22,11 @@ FALLBACK_SUGGESTIONS = [
     "a cup of coffee on a wooden desk",
 ]
 
+
+def _get_name(src: str) -> str:
+    return src.split("/")[-1].split("\\")[-1]
+
+
 # ── global state ──────────────────────────────────────────────────────────────
 favorites: list[str] = []
 search_history: list[str] = []
@@ -107,10 +112,18 @@ def _run(q_type, q_val, top_k, min_score):
         results = search_by_image(q_val, top_k=int(top_k), score_threshold=min_score)
     elapsed = time.time() - start
     gallery = []
+
     for meta, score in results:
-        p = meta.get("path", "")
-        if os.path.exists(p):
-            gallery.append((p, f"{score:.3f}"))
+        # 优先用 coco_url（Kaggle上传的），没有就用本地path（子集用的）
+        src = meta.get("coco_url") or meta.get("path", "")
+
+        # 兜底：如果元数据只有 image_id（当时批量上传漏传了完整URL），动态拼接COCO网络路径
+        if not src and "image_id" in meta:
+            img_id = int(meta["image_id"])
+            src = f"http://images.cocodataset.org/val2017/{img_id:012d}.jpg"
+
+        if src and (src.startswith("http") or os.path.exists(src)):
+            gallery.append((src, f"{score:.3f}"))
     return gallery, f"{len(gallery)} results · {elapsed:.2f}s"
 
 
@@ -189,7 +202,7 @@ def reveal_preview(path):
             gr.update(visible=True),
             gr.update(value=path, visible=True),
             gr.update(value=btn_text, visible=True),
-            Path(path).name,
+            _get_name(path),
         )
     return (
         gr.update(visible=False),
@@ -203,7 +216,7 @@ def toggle_fav(current_path):
     if not current_path:
         return (
             gr.update(),
-            [(p, Path(p).name) for p in favorites],
+            [(p, _get_name(p)) for p in favorites],
             f"{len(favorites)} saved",
         )
 
@@ -215,7 +228,7 @@ def toggle_fav(current_path):
         btn_text = "❤️ Saved"
 
     # Return list of (path, label) for gallery
-    fav_gal = [(p, Path(p).name) for p in favorites]
+    fav_gal = [(p, _get_name(p)) for p in favorites]
     return gr.update(value=btn_text), fav_gal, f"{len(favorites)} saved"
 
 
@@ -230,7 +243,7 @@ def export_fav():
     zip_path = "favorites.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
         for p in favorites:
-            zf.write(p, Path(p).name)
+            zf.write(p, _get_name(p))
     return zip_path
 
 

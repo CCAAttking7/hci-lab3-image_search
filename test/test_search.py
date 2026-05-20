@@ -1,4 +1,4 @@
-from search import search_by_text
+from src.search import search_by_text
 
 results = search_by_text("a dog running on grass", top_k=5)
 print(f"Got {len(results)} results:")
