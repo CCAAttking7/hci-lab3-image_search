@@ -1,0 +1,18 @@
+[project]
+name = "hci-lab3-image-search"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "clip",
+    "datasets>=4.8.5",
+    "gradio>=6.14.0",
+    "python-dotenv>=1.2.2",
+    "torch>=2.12.0",
+    "torchvision>=0.27.0",
+    "upstash-vector>=0.8.0",
+]
+
+[tool.uv.sources]
+clip = { git = "https://github.com/openai/CLIP.git" }
