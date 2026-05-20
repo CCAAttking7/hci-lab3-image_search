@@ -1,316 +1,548 @@
-"""
-app.py — Gradio 图像搜索界面
-Five-Stage Search Framework 实现
-"""
-
 import gradio as gr
 from PIL import Image
 import time
 import zipfile
 import os
-import io
-import base64
 from pathlib import Path
-from search import search_by_text, search_by_image  # 你写的 search.py
+from search import search_by_text, search_by_image
 
-# ─────────────────────────────────────────────
-# 全局状态
-# ─────────────────────────────────────────────
-favorites: list[str] = []  # 收藏的图片路径列表
+import urllib.request
+import urllib.parse
+import json
 
-# ─────────────────────────────────────────────
-# 核心搜索函数
-# ─────────────────────────────────────────────
+# ── suggestion corpus fallback ────────────────────────────────────────────────
+FALLBACK_SUGGESTIONS = [
+    "a dog running in the snow",
+    "cats playing together",
+    "a modern living room",
+    "beautiful sunset over the ocean",
+    "people walking on a busy street",
+    "a table full of fresh fruits",
+    "cars passing by at night",
+    "a cup of coffee on a wooden desk",
+]
+
+# ── global state ──────────────────────────────────────────────────────────────
+favorites: list[str] = []
+search_history: list[str] = []
+_picking_suggestion = False  # guard flag
+
+# ── translation & dynamic suggestion helpers ─────────────────────────────────
 
 
-def do_text_search(query: str, top_k: int, min_score: float):
-    """文字搜索 → 返回结果供 Gallery 显示"""
+def translate_zh_to_en(text: str) -> str:
+    """If text contains Chinese, translate to English for CLIP."""
+    if not text.strip() or not any("\u4e00" <= char <= "\u9fff" for char in text):
+        return text
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={urllib.parse.quote(text)}&langpair=zh-CN|en"
+        # Dummy User-Agent to avoid blocks
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode())
+            return data["responseData"]["translatedText"]
+    except Exception:
+        return text
+
+
+def fetch_dynamic_suggestions(query: str) -> list[str]:
+    """Fetch live autocomplete suggestions from Bing API (Works better in China without proxy)."""
     if not query.strip():
-        return [], "⚠️ Please enter a search query.", query
+        return []
+    try:
+        url = f"https://api.bing.com/osjson.aspx?query={urllib.parse.quote(query)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            res = json.loads(resp.read().decode())
+            return res[1][:6]
+    except Exception:
+        return [s for s in FALLBACK_SUGGESTIONS if query.lower() in s.lower()][:6]
 
+
+def get_suggestions(text: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        # History
+        hist = [f"🕐  {h}" for h in reversed(search_history[-5:])]
+        popular = [f"🌟 {s}" for s in FALLBACK_SUGGESTIONS[: (6 - len(hist))]]
+        return hist + popular
+
+    # Otherwise fetch live from Bing or fallback
+    return fetch_dynamic_suggestions(text)
+
+
+def update_suggestions(text):
+    """Called on text_in.change — only show dropdown when user is actually typing."""
+    global _picking_suggestion
+    if _picking_suggestion:
+        # a suggestion was just picked; suppress re-render and reset guard
+        _picking_suggestion = False
+        return gr.update(visible=False)
+    suggestions = get_suggestions(text or "")
+    if not suggestions:
+        return gr.update(visible=False)
+    # Always show if we got valid suggestions (either history/fallback or API)
+    return gr.update(choices=suggestions, value=None, visible=True)
+
+
+def pick_suggestion(choice):
+    """Fill text box from suggestion, hide dropdown, set guard."""
+    global _picking_suggestion
+    if not choice:
+        return gr.update(), gr.update(visible=False)
+    _picking_suggestion = True
+    if choice.startswith("🕐  "):
+        choice = choice[5:].strip()
+    return gr.update(value=choice), gr.update(visible=False)
+
+
+# ── search ────────────────────────────────────────────────────────────────────
+
+
+def _run(q_type, q_val, top_k, min_score):
     start = time.time()
-    results = search_by_text(query, top_k=top_k, score_threshold=min_score)
+    if q_type == "text":
+        results = search_by_text(q_val, top_k=int(top_k), score_threshold=min_score)
+    else:
+        results = search_by_image(q_val, top_k=int(top_k), score_threshold=min_score)
     elapsed = time.time() - start
-
-    # 构建 Gallery 数据：(image, caption)
-    gallery_data = []
+    gallery = []
     for meta, score in results:
-        img_path = meta.get("path", "")
-        if os.path.exists(img_path):
-            caption = f"Score: {score:.3f} | {Path(img_path).name}"
-            gallery_data.append((img_path, caption))
+        p = meta.get("path", "")
+        if os.path.exists(p):
+            gallery.append((p, f"{score:.3f}"))
+    return gallery, f"{len(gallery)} results · {elapsed:.2f}s"
 
-    status = (
-        f"✅ Found **{len(gallery_data)}** results · Query time: **{elapsed:.2f}s**"
+
+def go_text(query, top_k, min_score):
+    if not query or not query.strip():
+        return (
+            [],
+            "No query yet.",
+            "—",
+            gr.update(visible=False),
+            {"type": None, "val": None},
+        )
+    q = query.strip()
+    if q not in search_history:
+        search_history.append(q)
+
+    # Translate if there's Chinese
+    translated_q = translate_zh_to_en(q)
+
+    gal, stat = _run("text", translated_q, top_k, min_score)
+
+    # Prepend translation status if it was translated
+    if translated_q != q:
+        stat = f"*(Translated to: {translated_q})*  |  {stat}"
+
+    return (
+        gal,
+        stat,
+        f'"{q}"',
+        gr.update(visible=False),
+        {"type": "text", "val": translated_q},
     )
-    preview_text = f'🔍 Query: "{query}"'
-    return gallery_data, status, preview_text
 
 
-def do_image_search(image: Image.Image, top_k: int, min_score: float):
-    """图片搜索 → 返回结果供 Gallery 显示"""
-    if image is None:
-        return [], "⚠️ Please upload an image.", "No image uploaded"
-
-    start = time.time()
-    results = search_by_image(image, top_k=top_k, score_threshold=min_score)
-    elapsed = time.time() - start
-
-    gallery_data = []
-    for meta, score in results:
-        img_path = meta.get("path", "")
-        if os.path.exists(img_path):
-            caption = f"Score: {score:.3f} | {Path(img_path).name}"
-            gallery_data.append((img_path, caption))
-
-    status = (
-        f"✅ Found **{len(gallery_data)}** results · Query time: **{elapsed:.2f}s**"
+def go_image(img, top_k, min_score):
+    if img is None:
+        return (
+            [],
+            "No image uploaded.",
+            "—",
+            gr.update(visible=False),
+            {"type": None, "val": None},
+        )
+    gal, stat = _run("image", img, top_k, min_score)
+    return (
+        gal,
+        stat,
+        "Image query",
+        gr.update(value=img, visible=True),
+        {"type": "image", "val": img},
     )
-    preview_text = "🖼️ Query: [Uploaded Image]"
-    return gallery_data, status, preview_text
 
 
-def add_to_favorites(evt: gr.SelectData, gallery_data):
-    """从 Gallery 点击图片加入收藏"""
-    global favorites
-    if evt.index < len(gallery_data):
-        img_path = gallery_data[evt.index][0]
-        if img_path not in favorites:
-            favorites.append(img_path)
-    fav_gallery = [(p, Path(p).name) for p in favorites]
-    return fav_gallery, f"❤️ {len(favorites)} image(s) in favorites"
+def refine(state, top_k, min_score):
+    if not state or not state.get("type"):
+        return gr.update(), gr.update()
+    gal, stat = _run(state["type"], state["val"], top_k, min_score)
+    return gal, stat
 
 
-def export_favorites_zip():
-    """将收藏图片打包为 ZIP 下载"""
+# ── preview & favorites ───────────────────────────────────────────────────────
+
+
+def open_preview(evt: gr.SelectData, gallery):
+    if gallery and evt.index < len(gallery):
+        path = gallery[evt.index][0]
+        return path
+    return None
+
+
+def reveal_preview(path):
+    if path:
+        is_fav = path in favorites
+        btn_text = "❤️ Saved" if is_fav else "♡  Save to favorites"
+        return (
+            gr.update(visible=True),
+            gr.update(value=path, visible=True),
+            gr.update(value=btn_text, visible=True),
+            Path(path).name,
+        )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        "",
+    )
+
+
+def toggle_fav(current_path):
+    if not current_path:
+        return (
+            gr.update(),
+            [(p, Path(p).name) for p in favorites],
+            f"{len(favorites)} saved",
+        )
+
+    if current_path in favorites:
+        favorites.remove(current_path)
+        btn_text = "♡  Save to favorites"
+    else:
+        favorites.append(current_path)
+        btn_text = "❤️ Saved"
+
+    # Return list of (path, label) for gallery
+    fav_gal = [(p, Path(p).name) for p in favorites]
+    return gr.update(value=btn_text), fav_gal, f"{len(favorites)} saved"
+
+
+def clear_fav():
+    favorites.clear()
+    return gr.update(value="♡  Save to favorites"), [], "0 saved"
+
+
+def export_fav():
     if not favorites:
         return None
-    zip_path = "/tmp/favorites.zip"
+    zip_path = "favorites.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
         for p in favorites:
             zf.write(p, Path(p).name)
     return zip_path
 
 
-def clear_favorites():
-    """清空收藏"""
-    global favorites
-    favorites = []
-    return [], "❤️ 0 image(s) in favorites"
-
-
-# ─────────────────────────────────────────────
-# Gradio 界面定义
-# ─────────────────────────────────────────────
-
+# ── CSS ───────────────────────────────────────────────────────────────────────
 CSS = """
-/* 整体背景 */
-body { background-color: #0f1117 !important; }
-.gradio-container { max-width: 1400px !important; font-family: 'Segoe UI', system-ui; }
+/* hide share/flag/download icons inside gallery toolbars */
+.gallery-container .icon-button-wrapper,
+.gallery-container .download-button,
+.gallery-container .share-button,
+.gallery-container [data-testid="share-btn"],
+.gallery-container [data-testid="download-btn"],
+.gallery-container [aria-label="Share"],
+.gallery-container [aria-label="Download"],
+.gallery-container [aria-label="Expand"],
+.toolbar { display: none !important; }
+footer { display: none !important; }
 
-/* 标题区 */
-.app-header { text-align: center; padding: 24px 0 8px; }
-.app-header h1 { font-size: 2.4rem; font-weight: 700; color: #e8eaf6; letter-spacing: -0.5px; }
-.app-header p { color: #9e9eb3; font-size: 0.95rem; }
+.gradio-container { max-width: 1100px !important; }
 
-/* 卡片面板 */
-.panel-card { background: #1a1d2e; border-radius: 16px; padding: 20px; border: 1px solid #2a2d3e; }
-
-/* 状态栏 */
-.status-bar { 
-    background: #1e2235; border-radius: 10px; padding: 10px 16px;
-    font-size: 0.9rem; color: #7c85b3; border: 1px solid #2a2d3e;
+/* app shell */
+#app-row { gap: 0 !important; }
+#sidebar {
+    border-right: 0.5px solid var(--border-color-primary);
+    padding: 20px 16px !important;
+    background: var(--background-fill-secondary) !important;
+    min-width: 268px !important;
+    max-width: 268px !important;
 }
 
-/* 搜索按钮 */
-.search-btn { 
-    background: linear-gradient(135deg, #667eea, #764ba2) !important;
-    border: none !important; color: white !important;
-    font-size: 1.05rem !important; font-weight: 600 !important;
-    border-radius: 12px !important; padding: 12px 0 !important;
-}
-.search-btn:hover { opacity: 0.9 !important; transform: translateY(-1px) !important; }
+/* logo */
+#logo { padding-bottom: 12px; border-bottom: 0.5px solid var(--border-color-primary); margin-bottom: 2px; }
+#logo h1 { font-size: 15px !important; font-weight: 600; margin: 0 !important; }
+#logo p  { font-size: 11px; color: var(--body-text-color-subdued); margin: 2px 0 0 !important; }
 
-/* Gallery 图片卡片 */
-.gallery-item img { border-radius: 10px; transition: transform 0.2s; }
-.gallery-item img:hover { transform: scale(1.03); }
+/* tabs compact */
+#mode-tabs .tab-nav { padding: 3px; background: var(--background-fill-primary);
+    border-radius: 8px; border: 0.5px solid var(--border-color-primary); }
+#mode-tabs .tab-nav button { font-size: 12px !important; padding: 5px 10px !important; border-radius: 6px !important; }
+#mode-tabs > div { padding: 0 !important; border: none !important; background: transparent !important; }
+
+/* query textbox */
+#text-query textarea { font-size: 13px !important; border-radius: 8px !important; }
+#text-query label span { font-size: 11px !important; font-weight: 500; letter-spacing: .04em; }
+
+/* suggestion dropdown — flush under textbox, no gap */
+#suggestion-box {
+    border: 0.5px solid var(--border-color-primary);
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--background-fill-primary);
+    margin-top: 2px;
+    padding: 4px 0;
+}
+#suggestion-box .wrap { gap: 0 !important; flex-direction: column !important; }
+#suggestion-box label { 
+    padding: 7px 12px !important; 
+    font-size: 13px !important; 
+    cursor: pointer;
+    border-radius: 0 !important;
+    margin: 0 !important;
+}
+#suggestion-box label:hover { background: var(--background-fill-secondary) !important; }
+#suggestion-box input[type=radio] { display: none !important; }
+#suggestion-box .svelte-1gfkn6j { display: none !important; }
+
+/* sliders */
+.param-slider label span { font-size: 11px !important; }
+
+/* main column */
+#main-col { padding: 0 !important; }
+
+/* top bar */
+#topbar {
+    padding: 9px 16px;
+    border-bottom: 0.5px solid var(--border-color-primary);
+    background: var(--background-fill-primary);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 40px;
+}
+#query-pill {
+    background: var(--background-fill-secondary);
+    border: 0.5px solid var(--border-color-primary);
+    border-radius: 99px;
+    padding: 3px 12px;
+    font-size: 12px;
+    max-width: 360px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+#result-stat { font-size: 12px; color: var(--body-text-color-subdued); }
+
+/* gallery */
+#result-gallery { padding: 12px 16px !important; }
+#result-gallery .grid-wrap { gap: 7px !important; }
+#result-gallery img { border-radius: 7px !important; }
+
+/* preview panel */
+#preview-row {
+    margin: 0 16px 10px;
+    padding: 12px 16px;
+    border: 0.5px solid var(--border-color-primary);
+    border-radius: 10px;
+    background: var(--background-fill-secondary);
+}
+#preview-row > div { gap: 14px !important; align-items: center !important; }
+#preview-img img { border-radius: 8px !important; object-fit: cover !important; }
+#selected-name { font-size: 12px; color: var(--body-text-color-subdued); margin: 0 !important; }
+#save-btn { font-size: 12px !important; border-radius: 7px !important; }
+
+/* bottom bar */
+#bottom-bar {
+    border-top: 0.5px solid var(--border-color-primary);
+    padding: 8px 16px;
+    align-items: center !important;
+    gap: 10px !important;
+}
+#fav-count-md { font-size: 12px; color: var(--body-text-color-subdued); white-space: nowrap; margin: 0 !important; }
+#fav-gallery { flex: 1; min-height: 40px !important; }
+#fav-gallery .grid-wrap { gap: 4px !important; }
+#fav-gallery img { border-radius: 5px !important; }
+#dl-btn, #clear-btn { font-size: 12px !important; border-radius: 7px !important; white-space: nowrap; }
 """
 
-with gr.Blocks(title="Visual Search · CLIP") as demo:
-    # ── 标题 ──────────────────────────────────────────
-    gr.HTML("""
-    <div class="app-header">
-        <h1>🔍 Visual Search</h1>
-        <p>Semantic Image Retrieval powered by CLIP + Upstash Vector</p>
-    </div>
-    """)
+# ── UI ────────────────────────────────────────────────────────────────────────
+with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
+    last_query = gr.State({"type": None, "val": None})
+    sel_path = gr.State(None)
 
-    # ── 主体：两列布局 ─────────────────────────────────
-    with gr.Row():
-        # ════════════════════════════
-        # LEFT: 输入 Panel
-        # ════════════════════════════
-        with gr.Column(scale=1, elem_classes="panel-card"):
-            gr.Markdown("### 🗂 Search Input")
-
-            # Tabs：文字 / 图片
-            with gr.Tabs() as input_tabs:
-                # ── Tab 1: 文字搜索 (Formulation) ──
-                with gr.TabItem("📝 Text Search"):
-                    text_input = gr.Textbox(
-                        placeholder="e.g. a dog playing in the park...",
-                        label="Search Query",
-                        lines=2,
-                    )
-                    # 查询预览 (Formulation: preview)
-                    text_preview = gr.Textbox(
-                        label="🔎 Query Preview",
-                        interactive=False,
-                        value="Type something above to preview your query",
-                    )
-                    # 实时更新预览
-                    text_input.change(
-                        fn=lambda t: (
-                            f'🔍 Query: "{t}"' if t.strip() else "No query yet"
-                        ),
-                        inputs=text_input,
-                        outputs=text_preview,
-                    )
-                    text_search_btn = gr.Button(
-                        "🔍 Search by Text",
-                        variant="primary",
-                        elem_classes="search-btn",
-                    )
-
-                # ── Tab 2: 图片搜索 (Formulation) ──
-                with gr.TabItem("🖼️ Image Search"):
-                    image_input = gr.Image(
-                        label="Upload Query Image", type="pil", height=220
-                    )
-                    # 查询预览 (Formulation: image preview)
-                    img_preview_status = gr.Textbox(
-                        label="🔎 Query Preview",
-                        interactive=False,
-                        value="Upload an image to preview",
-                    )
-                    image_input.change(
-                        fn=lambda img: (
-                            "✅ Image uploaded — ready to search"
-                            if img is not None
-                            else "No image yet"
-                        ),
-                        inputs=image_input,
-                        outputs=img_preview_status,
-                    )
-                    image_search_btn = gr.Button(
-                        "🔍 Search by Image",
-                        variant="primary",
-                        elem_classes="search-btn",
-                    )
-
-            gr.Markdown("---")
-            gr.Markdown("### ⚙️ Search Parameters")
-
-            # 参数调整 (Refinement)
-            top_k_slider = gr.Slider(
-                minimum=4, maximum=48, value=12, step=4, label="Top-K Results"
+    with gr.Row(elem_id="app-row", equal_height=True):
+        # ══════════════ SIDEBAR ══════════════
+        with gr.Column(elem_id="sidebar", scale=0):
+            gr.HTML(
+                '<div id="logo"><h1>HCI_lab3</h1><p>Semantic image search</p></div>'
             )
-            min_score_slider = gr.Slider(
-                minimum=0.0,
-                maximum=1.0,
+
+            with gr.Tabs(elem_id="mode-tabs"):
+                with gr.Tab("Text"):
+                    text_in = gr.Textbox(
+                        placeholder="e.g. a dog running in snow…",
+                        label="Query",
+                        lines=2,
+                        elem_id="text-query",
+                    )
+                    suggestion_box = gr.Radio(
+                        choices=[],
+                        label="",
+                        visible=False,
+                        elem_id="suggestion-box",
+                    )
+                    btn_text = gr.Button("Search", variant="primary")
+
+                with gr.Tab("Image"):
+                    img_in = gr.Image(
+                        label="Upload query image",
+                        type="pil",
+                        height=160,
+                    )
+                    img_preview_thumb = gr.Image(
+                        interactive=False,
+                        show_label=False,
+                        visible=False,
+                        height=56,
+                    )
+                    btn_img = gr.Button("Search", variant="primary")
+
+            gr.HTML(
+                '<hr style="border:none;border-top:0.5px solid var(--border-color-primary);margin:10px 0">'
+            )
+
+            top_k = gr.Slider(
+                4, 48, value=12, step=4, label="Results", elem_classes="param-slider"
+            )
+            min_score = gr.Slider(
+                0.0,
+                1.0,
                 value=0.20,
                 step=0.05,
-                label="Minimum Similarity Score",
+                label="Min similarity",
+                elem_classes="param-slider",
             )
 
-        # ════════════════════════════
-        # RIGHT: 结果 Panel
-        # ════════════════════════════
-        with gr.Column(scale=2, elem_classes="panel-card"):
-            gr.Markdown("### 📊 Search Results")
+        # ══════════════ MAIN ══════════════
+        with gr.Column(elem_id="main-col", scale=1):
+            # top bar
+            with gr.Row(elem_id="topbar"):
+                query_pill_md = gr.Markdown("—", elem_id="query-pill")
+                result_stat = gr.Markdown("", elem_id="result-stat")
 
-            # 结果概览 (Review)
-            status_bar = gr.Markdown(
-                value="Results will appear here after search.",
-                elem_classes="status-bar",
-            )
-
-            # 结果 Gallery (Review)
+            # results
             result_gallery = gr.Gallery(
-                label="Retrieved Images",
-                columns=3,
-                height=420,
-                object_fit="cover",
-                show_label=False,
-                allow_preview=True,  # 点击放大
-            )
-
-            gr.Markdown("---")
-            gr.Markdown("### ❤️ Favorites")
-
-            # 收藏区 (Use)
-            fav_status = gr.Markdown("❤️ 0 image(s) in favorites")
-            fav_gallery = gr.Gallery(
-                label="Saved Images",
+                label="",
                 columns=4,
-                height=200,
-                object_fit="cover",
+                height=390,
+                allow_preview=False,
                 show_label=False,
+                elem_id="result-gallery",
             )
 
-            with gr.Row():
-                export_btn = gr.Button(
-                    "⬇️ Download Favorites (ZIP)", variant="secondary"
+            # preview panel (hidden until image clicked)
+            with gr.Row(elem_id="preview-row", visible=False) as preview_row:
+                sel_img_display = gr.Image(
+                    interactive=False,
+                    show_label=False,
+                    height=140,
+                    width=140,
+                    elem_id="preview-img",
                 )
-                clear_fav_btn = gr.Button("🗑 Clear Favorites", variant="stop")
+                with gr.Column(scale=1):
+                    sel_name_md = gr.Markdown("", elem_id="selected-name")
+                    save_btn = gr.Button(
+                        "♡  Save to favorites",
+                        variant="secondary",
+                        elem_id="save-btn",
+                        visible=False,
+                    )
 
-            export_file = gr.File(label="Download", visible=True)
+            # bottom bar
+            with gr.Row(elem_id="bottom-bar"):
+                fav_count_md = gr.Markdown("0 saved", elem_id="fav-count-md")
+                fav_gallery = gr.Gallery(
+                    label="",
+                    columns=8,
+                    height=70,
+                    show_label=False,
+                    allow_preview=False,
+                    container=False,
+                    elem_id="fav-gallery",
+                )
+                dl_btn = gr.Button("↓ ZIP", variant="secondary", elem_id="dl-btn")
+                clear_btn = gr.Button("Clear", variant="stop", elem_id="clear-btn")
 
-    # ─────────────────────────────────────────────
-    # 事件绑定
-    # ─────────────────────────────────────────────
+            out_file = gr.File(label="Download", visible=True)
 
-    # 文字搜索触发
-    text_search_btn.click(
-        fn=do_text_search,
-        inputs=[text_input, top_k_slider, min_score_slider],
-        outputs=[result_gallery, status_bar, text_preview],
+    # ── events ────────────────────────────────────────────────────────────────
+
+    # suggestions: only on non-empty input change
+    text_in.change(
+        fn=update_suggestions,
+        inputs=[text_in],
+        outputs=[suggestion_box],
     )
 
-    # 图片搜索触发
-    image_search_btn.click(
-        fn=do_image_search,
-        inputs=[image_input, top_k_slider, min_score_slider],
-        outputs=[result_gallery, status_bar, img_preview_status],
+    # picking a suggestion fills the box and hides dropdown
+    suggestion_box.change(
+        fn=pick_suggestion,
+        inputs=[suggestion_box],
+        outputs=[text_in, suggestion_box],
     )
 
-    # 点击图片 → 加入收藏 (Use)
+    # sidebar image thumb preview
+    img_in.change(
+        fn=lambda img: (
+            gr.update(value=img, visible=True) if img else gr.update(visible=False)
+        ),
+        inputs=[img_in],
+        outputs=[img_preview_thumb],
+    )
+
+    # text search
+    btn_text.click(
+        fn=go_text,
+        inputs=[text_in, top_k, min_score],
+        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+    )
+
+    text_in.submit(
+        fn=go_text,
+        inputs=[text_in, top_k, min_score],
+        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+    )
+
+    btn_img.click(
+        fn=go_image,
+        inputs=[img_in, top_k, min_score],
+        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+    )
+
+    # refinement
+    top_k.change(
+        fn=refine,
+        inputs=[last_query, top_k, min_score],
+        outputs=[result_gallery, result_stat],
+    )
+    min_score.change(
+        fn=refine,
+        inputs=[last_query, top_k, min_score],
+        outputs=[result_gallery, result_stat],
+    )
+
+    # click image → preview panel
     result_gallery.select(
-        fn=add_to_favorites, inputs=[result_gallery], outputs=[fav_gallery, fav_status]
+        fn=open_preview,
+        inputs=[result_gallery],
+        outputs=[sel_path],
+    )
+    sel_path.change(
+        fn=reveal_preview,
+        inputs=[sel_path],
+        outputs=[preview_row, sel_img_display, save_btn, sel_name_md],
     )
 
-    # 导出收藏 ZIP
-    export_btn.click(fn=export_favorites_zip, outputs=export_file)
+    # favorites
+    save_btn.click(
+        fn=toggle_fav, inputs=[sel_path], outputs=[save_btn, fav_gallery, fav_count_md]
+    )
+    dl_btn.click(fn=export_fav, outputs=[out_file])
+    clear_btn.click(fn=clear_fav, outputs=[save_btn, fav_gallery, fav_count_md])
 
-    # 清空收藏
-    clear_fav_btn.click(fn=clear_favorites, outputs=[fav_gallery, fav_status])
 
-    # 参数变化时自动重新搜索（Refinement：改参数即刷新）
-    # 注意：需要 last_query state 来记住上次查询
-    # 此处用简单版：改参数后手动点 Search 按钮即可
-    # 进阶版：可加 gr.State 保存上次查询类型和内容
-
-# ─────────────────────────────────────────────
-# 启动
-# ─────────────────────────────────────────────
 if __name__ == "__main__":
-    import os
-
     os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
-
-    demo.launch(
-        server_port=7860,
-        share=False,  # 改为 True 可生成公开链接
-        show_error=True,
-        css=CSS,
-    )
+    demo.launch(server_port=7860, share=False, show_error=True)
