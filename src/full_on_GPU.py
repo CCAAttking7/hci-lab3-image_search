@@ -44,6 +44,18 @@ BATCH_SIZE = 50
 vectors_to_upsert = []
 uploaded, skipped = 0, 0
 
+
+def encode_pil(img):
+    None  # 这里应该是你之前定义好的函数，负责将 PIL 图片编码成向量。确保它在当前环境中可用。
+
+
+"""def encode_pil(img):
+                t = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
+                with torch.no_grad():
+                    f = model.encode_image(t)
+                    f = f / f.norm(dim=-1, keepdim=True)
+                return f.cpu().numpy()[0].tolist()"""
+
 for item in tqdm(ds):
     img_id = str(item["image_id"])
     image_download_url = item["coco_url"]
@@ -54,12 +66,7 @@ for item in tqdm(ds):
         resp.raise_for_status()
         img = Image.open(io.BytesIO(resp.content))
         # 注意，这里encode_pill是在之前的代码里定义好的一个函数，负责将PIL图片编码成向量
-        """def encode_pil(img):
-                t = preprocess(img.convert("RGB")).unsqueeze(0).to(device)
-                with torch.no_grad():
-                    f = model.encode_image(t)
-                    f = f / f.norm(dim=-1, keepdim=True)
-                return f.cpu().numpy()[0].tolist()"""
+
         vec = encode_pil(img)  # 这里调用你之前定义好的 encode_pil
 
         if vec is None:

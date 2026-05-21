@@ -135,6 +135,7 @@ def go_text(query, top_k, min_score):
             "—",
             gr.update(visible=False),
             {"type": None, "val": None},
+            [],
         )
     q = query.strip()
     if q not in search_history:
@@ -155,6 +156,7 @@ def go_text(query, top_k, min_score):
         f'"{q}"',
         gr.update(visible=False),
         {"type": "text", "val": translated_q},
+        gal,
     )
 
 
@@ -166,6 +168,7 @@ def go_image(img, top_k, min_score):
             "—",
             gr.update(visible=False),
             {"type": None, "val": None},
+            [],
         )
     gal, stat = _run("image", img, top_k, min_score)
     return (
@@ -174,22 +177,23 @@ def go_image(img, top_k, min_score):
         "Image query",
         gr.update(value=img, visible=True),
         {"type": "image", "val": img},
+        gal,
     )
 
 
 def refine(state, top_k, min_score):
     if not state or not state.get("type"):
-        return gr.update(), gr.update()
+        return gr.update(), gr.update(), []
     gal, stat = _run(state["type"], state["val"], top_k, min_score)
-    return gal, stat
+    return gal, stat, gal
 
 
 # ── preview & favorites ───────────────────────────────────────────────────────
 
 
-def open_preview(evt: gr.SelectData, gallery):
-    if gallery and evt.index < len(gallery):
-        path = gallery[evt.index][0]
+def open_preview(evt: gr.SelectData, results_state):
+    if results_state and evt.index < len(results_state):
+        path = results_state[evt.index][0]
         return path
     return None
 
@@ -200,23 +204,31 @@ def reveal_preview(path):
         btn_text = "❤️ Saved" if is_fav else "♡  Save to favorites"
         return (
             gr.update(visible=True),
-            gr.update(value=path, visible=True),
+            f'<img src="{path}" style="width:140px; height:140px; object-fit:cover; border-radius:8px;" />',
             gr.update(value=btn_text, visible=True),
             _get_name(path),
         )
     return (
         gr.update(visible=False),
-        gr.update(visible=False),
+        "",
         gr.update(visible=False),
         "",
     )
+
+
+def _render_fav_html():
+    html = '<div style="display:flex; gap:6px; overflow-x:auto; min-height:60px; padding:2px;">'
+    for p in favorites:
+        html += f'<img src="{p}" style="height:60px; width:60px; object-fit:cover; border-radius:4px; border:1px solid var(--border-color-primary); flex-shrink:0;" />'
+    html += "</div>"
+    return html
 
 
 def toggle_fav(current_path):
     if not current_path:
         return (
             gr.update(),
-            [(p, _get_name(p)) for p in favorites],
+            _render_fav_html(),
             f"{len(favorites)} saved",
         )
 
@@ -227,14 +239,12 @@ def toggle_fav(current_path):
         favorites.append(current_path)
         btn_text = "❤️ Saved"
 
-    # Return list of (path, label) for gallery
-    fav_gal = [(p, _get_name(p)) for p in favorites]
-    return gr.update(value=btn_text), fav_gal, f"{len(favorites)} saved"
+    return gr.update(value=btn_text), _render_fav_html(), f"{len(favorites)} saved"
 
 
 def clear_fav():
     favorites.clear()
-    return gr.update(value="♡  Save to favorites"), [], "0 saved"
+    return gr.update(value="♡  Save to favorites"), _render_fav_html(), "0 saved"
 
 
 def export_fav():
@@ -243,7 +253,15 @@ def export_fav():
     zip_path = "favorites.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
         for p in favorites:
-            zf.write(p, _get_name(p))
+            if p.startswith("http"):
+                req = urllib.request.Request(p, headers={"User-Agent": "Mozilla/5.0"})
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        zf.writestr(_get_name(p), resp.read())
+                except Exception:
+                    pass
+            elif os.path.exists(p):
+                zf.write(p, _get_name(p))
     return zip_path
 
 
@@ -374,6 +392,7 @@ footer { display: none !important; }
 with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
     last_query = gr.State({"type": None, "val": None})
     sel_path = gr.State(None)
+    current_results = gr.State([])
 
     with gr.Row(elem_id="app-row", equal_height=True):
         # ══════════════ SIDEBAR ══════════════
@@ -447,11 +466,7 @@ with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
 
             # preview panel (hidden until image clicked)
             with gr.Row(elem_id="preview-row", visible=False) as preview_row:
-                sel_img_display = gr.Image(
-                    interactive=False,
-                    show_label=False,
-                    height=140,
-                    width=140,
+                sel_img_display = gr.HTML(
                     elem_id="preview-img",
                 )
                 with gr.Column(scale=1):
@@ -466,13 +481,8 @@ with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
             # bottom bar
             with gr.Row(elem_id="bottom-bar"):
                 fav_count_md = gr.Markdown("0 saved", elem_id="fav-count-md")
-                fav_gallery = gr.Gallery(
-                    label="",
-                    columns=8,
-                    height=70,
-                    show_label=False,
-                    allow_preview=False,
-                    container=False,
+                fav_gallery = gr.HTML(
+                    value=_render_fav_html(),
                     elem_id="fav-gallery",
                 )
                 dl_btn = gr.Button("↓ ZIP", variant="secondary", elem_id="dl-btn")
@@ -509,37 +519,58 @@ with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
     btn_text.click(
         fn=go_text,
         inputs=[text_in, top_k, min_score],
-        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+        outputs=[
+            result_gallery,
+            result_stat,
+            query_pill_md,
+            preview_row,
+            last_query,
+            current_results,
+        ],
     )
 
     text_in.submit(
         fn=go_text,
         inputs=[text_in, top_k, min_score],
-        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+        outputs=[
+            result_gallery,
+            result_stat,
+            query_pill_md,
+            preview_row,
+            last_query,
+            current_results,
+        ],
     )
 
     btn_img.click(
         fn=go_image,
         inputs=[img_in, top_k, min_score],
-        outputs=[result_gallery, result_stat, query_pill_md, gr.State(), last_query],
+        outputs=[
+            result_gallery,
+            result_stat,
+            query_pill_md,
+            preview_row,
+            last_query,
+            current_results,
+        ],
     )
 
     # refinement
     top_k.change(
         fn=refine,
         inputs=[last_query, top_k, min_score],
-        outputs=[result_gallery, result_stat],
+        outputs=[result_gallery, result_stat, current_results],
     )
     min_score.change(
         fn=refine,
         inputs=[last_query, top_k, min_score],
-        outputs=[result_gallery, result_stat],
+        outputs=[result_gallery, result_stat, current_results],
     )
 
     # click image → preview panel
     result_gallery.select(
         fn=open_preview,
-        inputs=[result_gallery],
+        inputs=[current_results],
         outputs=[sel_path],
     )
     sel_path.change(
