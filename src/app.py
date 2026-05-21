@@ -406,7 +406,8 @@ with gr.Blocks(title="HCI_lab3 · Visual Search", css=CSS) as demo:
                     text_in = gr.Textbox(
                         placeholder="e.g. a dog running in snow…",
                         label="Query",
-                        lines=2,
+                        lines=1,
+                        max_lines=4,
                         elem_id="text-query",
                     )
                     suggestion_box = gr.Radio(
